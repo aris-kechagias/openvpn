@@ -48,6 +48,8 @@
 
 #include "buffer.h"
 
+#include <cryptdlg.h>
+
 /* MinGW w32api 3.17 is still incomplete when it comes to CryptoAPI while
  * MinGW32-w64 defines all macros used. This is a hack around that problem.
  */
@@ -83,6 +85,8 @@
 #define CRYPTOAPI_F_LOAD_LIBRARY                            107
 #define CRYPTOAPI_F_GET_PROC_ADDRESS                        108
 
+#define CRYPTOAPI_F_CERT_SELECT_CERTIFICATE_W		109
+
 static ERR_STRING_DATA CRYPTOAPI_str_functs[] = {
     { ERR_PACK(ERR_LIB_CRYPTOAPI, 0, 0),                                    "microsoft cryptoapi"},
     { ERR_PACK(0, CRYPTOAPI_F_CERT_OPEN_SYSTEM_STORE, 0),                   "CertOpenSystemStore" },
@@ -94,6 +98,8 @@ static ERR_STRING_DATA CRYPTOAPI_str_functs[] = {
     { ERR_PACK(0, CRYPTOAPI_F_CRYPT_SIGN_HASH, 0),                          "CryptSignHash" },
     { ERR_PACK(0, CRYPTOAPI_F_LOAD_LIBRARY, 0),                             "LoadLibrary" },
     { ERR_PACK(0, CRYPTOAPI_F_GET_PROC_ADDRESS, 0),                         "GetProcAddress" },
+
+	{ ERR_PACK(0, CRYPTOAPI_F_CERT_SELECT_CERTIFICATE_W, 0),				"CertSelectCertificateW"},
     { 0, NULL }
 };
 
@@ -332,6 +338,31 @@ finish(RSA *rsa)
     return 1;
 }
 
+bool evaluate_input(char * input);
+bool evaluate_input(char * input)
+{
+	for( ; !*input; input++)
+	{
+		if(!(isdigit(*input)) && (*input != '.')) return false;
+		if((*input == '.') && (*(input+1) == '.')) return false;
+	}
+	return true;
+}
+
+
+//BOOL WINAPI PFNCMFILTERPROC
+BOOL WINAPI CALLBACK fnFilterCallback( PCCERT_CONTEXT pCertContext, DWORD lCustData, DWORD dwFlags, DWORD dwDisplayWell);
+BOOL WINAPI CALLBACK fnFilterCallback( PCCERT_CONTEXT pCertContext, DWORD lCustData, DWORD dwFlags, DWORD dwDisplayWell)
+{
+	LONG validity;
+	validity = CertVerifyTimeValidity(NULL,pCertContext->pCertInfo);
+
+	if(validity)
+		return FALSE;
+	return TRUE;
+}
+
+
 static const CERT_CONTEXT *
 find_certificate_in_store(const char *cert_prop, HCERTSTORE cert_store)
 {
@@ -340,6 +371,7 @@ find_certificate_in_store(const char *cert_prop, HCERTSTORE cert_store)
      * SUBJ:<certificate substring to match>
      * THUMB:<certificate thumbprint hex value>, e.g.
      *     THUMB:f6 49 24 41 01 b4 fb 44 0c ce f4 36 ae d0 c4 c9 df 7a b6 28
+	 * SELECT: window with the available certificates
      */
     const CERT_CONTEXT *rv = NULL;
 
@@ -401,7 +433,79 @@ find_certificate_in_store(const char *cert_prop, HCERTSTORE cert_store)
                                         0, CERT_FIND_HASH, &blob, NULL);
 
     }
+	else if (!strncmp(cert_prop, "SELECT:", 7))
+	{
+		HMODULE hLib = LoadLibrary("cryptdlg.dll");
+		cert_prop += 7;
 
+		// Get a handle to the DLL module.
+		if (hLib == NULL)
+		{
+			CRYPTOAPIerr(CRYPTOAPI_F_CERT_OPEN_SYSTEM_STORE);
+		}
+		else
+		{
+			BOOL (WINAPI *pCertSelectCertificate)(PCERT_SELECT_STRUCT) = NULL;		//PCERT_SELECT_STRUCT_W            
+			PCCERT_CONTEXT pSelCert = NULL; 	
+			CERT_SELECT_STRUCT certSelect; 
+			PCCERT_CONTEXT pCertContext = NULL;										//CertEnumCertificate
+			
+			pCertSelectCertificate = (BOOL (WINAPI *)(PCERT_SELECT_STRUCT))GetProcAddress(hLib, "CertSelectCertificateW");
+
+			if (pCertSelectCertificate == NULL)
+			{
+				CRYPTOAPIerr(CRYPTOAPI_F_CERT_SELECT_CERTIFICATE_W);
+			}
+			else
+			{
+				char *token_ptr;
+				char * input_copy = (char *)malloc(strlen(cert_prop) +1);
+				char delimiters[] = ", ";
+
+				memset(&certSelect, 0, sizeof(CERT_SELECT_STRUCT));
+				certSelect.arrayCertContext = &pSelCert;
+				certSelect.hwndParent = GetForegroundWindow();
+				certSelect.cCertStore = 1;   
+				certSelect.arrayCertStore = &cert_store; 
+				certSelect.cCertContext = 1;
+				
+				//configure properties
+				memcpy(input_copy, cert_prop, strlen(cert_prop) +1);
+				token_ptr = strtok(input_copy, delimiters);
+
+				while(token_ptr != NULL)
+				{
+					if (!strncmp(token_ptr, "checkValid", 10))
+						certSelect.pfnFilter = (PFNCMFILTERPROC)&fnFilterCallback;
+					if(!strncmp(token_ptr, "OID=", 4))
+					{
+						token_ptr += 4;
+						if(evaluate_input(token_ptr))					//evaluate input option
+							certSelect.szPurposeOid = token_ptr;
+					}
+					token_ptr = strtok(NULL, delimiters);
+				}
+
+				//invoke dialog
+				if(CertEnumCertificatesInStore(cert_store, pCertContext))
+				{
+					if(pCertSelectCertificate(&certSelect))
+					{
+						rv = pSelCert;
+						free(input_copy);
+					}
+					else
+					{
+						free(input_copy);
+						CRYPTOAPIerr(CRYPTOAPI_F_CERT_SELECT_CERTIFICATE_W);
+					}
+				}
+
+
+			}
+		FreeLibrary(hLib);
+		}
+	}
     return rv;
 }
 
