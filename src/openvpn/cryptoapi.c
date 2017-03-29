@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2004 Peter 'Luna' Runestig <peter@runestig.com>
+ *               2016
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modifi-
@@ -47,7 +48,7 @@
 #include <assert.h>
 
 #include "buffer.h"
-
+#include <stdlib.h>
 #include <cryptdlg.h>
 
 /* MinGW w32api 3.17 is still incomplete when it comes to CryptoAPI while
@@ -84,8 +85,14 @@
 #define CRYPTOAPI_F_CRYPT_SIGN_HASH                         106
 #define CRYPTOAPI_F_LOAD_LIBRARY                            107
 #define CRYPTOAPI_F_GET_PROC_ADDRESS                        108
+#define CRYPTOAPI_F_CERT_SELECT_CERTIFICATE                 109
+#define CRYPTOAPI_F_FILE_ACCESS_FAILED                      110
 
-#define CRYPTOAPI_F_CERT_SELECT_CERTIFICATE_W		109
+#ifdef MAC
+#define CERT_SELECT_DLL ("CertSelectCertificateA")
+#else   /*!MAC */
+#define CERT_SELECT_DLL ("CertSelectCertificateW")
+#endif  /*MAC */
 
 static ERR_STRING_DATA CRYPTOAPI_str_functs[] = {
     { ERR_PACK(ERR_LIB_CRYPTOAPI, 0, 0),                                    "microsoft cryptoapi"},
@@ -98,8 +105,8 @@ static ERR_STRING_DATA CRYPTOAPI_str_functs[] = {
     { ERR_PACK(0, CRYPTOAPI_F_CRYPT_SIGN_HASH, 0),                          "CryptSignHash" },
     { ERR_PACK(0, CRYPTOAPI_F_LOAD_LIBRARY, 0),                             "LoadLibrary" },
     { ERR_PACK(0, CRYPTOAPI_F_GET_PROC_ADDRESS, 0),                         "GetProcAddress" },
-
-	{ ERR_PACK(0, CRYPTOAPI_F_CERT_SELECT_CERTIFICATE_W, 0),				"CertSelectCertificateW"},
+    { ERR_PACK(0, CRYPTOAPI_F_CERT_SELECT_CERTIFICATE, 0),                  CERT_SELECT_DLL},
+    { ERR_PACK(0, CRYPTOAPI_F_FILE_ACCESS_FAILED, 0),                       "FileAccessFailed"},
     { 0, NULL }
 };
 
@@ -338,40 +345,61 @@ finish(RSA *rsa)
     return 1;
 }
 
-bool evaluate_input(char * input);
-bool evaluate_input(char * input)
+/*called to evaluate the format of OID*/
+static bool evaluate_OID(char *input)
 {
-	for( ; !*input; input++)
-	{
-		if(!(isdigit(*input)) && (*input != '.')) return false;
-		if((*input == '.') && (*(input+1) == '.')) return false;
-	}
-	return true;
+    for (; !*input; input++)
+    {
+        if (!(isdigit(*input)) && (*input != '.'))
+        {
+            return false;
+        }
+        if ((*input == '.') && (*(input+1) == '.'))
+        {
+            return false;
+        }
+    }
+    return true;
 }
 
-
-//BOOL WINAPI PFNCMFILTERPROC
-BOOL WINAPI CALLBACK fnFilterCallback( PCCERT_CONTEXT pCertContext, DWORD lCustData, DWORD dwFlags, DWORD dwDisplayWell);
-BOOL WINAPI CALLBACK fnFilterCallback( PCCERT_CONTEXT pCertContext, DWORD lCustData, DWORD dwFlags, DWORD dwDisplayWell)
+/*callback for the CERT_SELECT_STRUCT to select only time valid certificates */
+BOOL WINAPI CALLBACK
+fnFilterCallback( PCCERT_CONTEXT pCertContext, DWORD lCustData, DWORD dwFlags, DWORD dwDisplayWell)
 {
-	LONG validity;
-	validity = CertVerifyTimeValidity(NULL,pCertContext->pCertInfo);
+    LONG validity;
+    validity = CertVerifyTimeValidity(NULL,pCertContext->pCertInfo);
 
-	if(validity)
-		return FALSE;
-	return TRUE;
+    if (validity)
+    {
+        return FALSE;
+    }
+    return TRUE;
 }
 
+/*get the home folder for the current user */
+static bool
+get_homedir(char *homedir, int length)
+{
+#ifdef _WIN32
+    snprintf(homedir, length, "%s%s", getenv("HOMEDRIVE"), getenv("HOMEPATH"));
+#else
+    snprintf(homedir, length, "%s", getenv("HOME"));
+#endif
+    return length < 0 ? false : true;
+}
 
 static const CERT_CONTEXT *
-find_certificate_in_store(const char *cert_prop, HCERTSTORE cert_store)
+find_certificate_in_store(const char *cert_prop, HCERTSTORE cert_store)                            /*, CAPI_DATA * cd */
 {
     /* Find, and use, the desired certificate from the store. The
      * 'cert_prop' certificate search string can look like this:
      * SUBJ:<certificate substring to match>
      * THUMB:<certificate thumbprint hex value>, e.g.
-     *     THUMB:f6 49 24 41 01 b4 fb 44 0c ce f4 36 ae d0 c4 c9 df 7a b6 28
-	 * SELECT: window with the available certificates
+     *   THUMB:f6 49 24 41 01 b4 fb 44 0c ce f4 36 ae d0 c4 c9 df 7a b6 28
+     * GUI: open a window with the available certificates
+     *          arguments (separated by ','): 
+     *            - OID=<OID>    list only certificates that match the OID
+     *            - includeOld   also include expired certificates
      */
     const CERT_CONTEXT *rv = NULL;
 
@@ -379,6 +407,7 @@ find_certificate_in_store(const char *cert_prop, HCERTSTORE cert_store)
     {
         /* skip the tag */
         cert_prop += 5;
+
         rv = CertFindCertificateInStore(cert_store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
                                         0, CERT_FIND_SUBJECT_STR_A, cert_prop, NULL);
 
@@ -392,7 +421,8 @@ find_certificate_in_store(const char *cert_prop, HCERTSTORE cert_store)
 
         /* skip the tag */
         cert_prop += 6;
-        for (p = (char *) cert_prop, i = 0; *p && i < sizeof(hash); i++) {
+        for (p = (char *) cert_prop, i = 0; *p && i < sizeof(hash); i++)
+        {
             if (*p >= '0' && *p <= '9')
             {
                 x = (*p - '0') << 4;
@@ -433,79 +463,201 @@ find_certificate_in_store(const char *cert_prop, HCERTSTORE cert_store)
                                         0, CERT_FIND_HASH, &blob, NULL);
 
     }
-	else if (!strncmp(cert_prop, "SELECT:", 7))
-	{
-		HMODULE hLib = LoadLibrary("cryptdlg.dll");
-		cert_prop += 7;
+    else if (!strncmp(cert_prop, "GUI:", 4))
+    {
 
-		// Get a handle to the DLL module.
-		if (hLib == NULL)
-		{
-			CRYPTOAPIerr(CRYPTOAPI_F_CERT_OPEN_SYSTEM_STORE);
-		}
-		else
-		{
-			BOOL (WINAPI *pCertSelectCertificate)(PCERT_SELECT_STRUCT) = NULL;		//PCERT_SELECT_STRUCT_W            
-			PCCERT_CONTEXT pSelCert = NULL; 	
-			CERT_SELECT_STRUCT certSelect; 
-			PCCERT_CONTEXT pCertContext = NULL;										//CertEnumCertificate
-			
-			pCertSelectCertificate = (BOOL (WINAPI *)(PCERT_SELECT_STRUCT))GetProcAddress(hLib, "CertSelectCertificateW");
+        DWORD WINAPI error_code;
+        /* load crypdlg library for opening a dialog box. */
+        HMODULE hLib = LoadLibrary("cryptdlg.dll");
+        PCCERT_CONTEXT pCertContext = NULL;
+        FILE *fp;
+        char saved_value[512];
+        bool certificate_match = false;
 
-			if (pCertSelectCertificate == NULL)
-			{
-				CRYPTOAPIerr(CRYPTOAPI_F_CERT_SELECT_CERTIFICATE_W);
-			}
-			else
-			{
-				char *token_ptr;
-				char * input_copy = (char *)malloc(strlen(cert_prop) +1);
-				char delimiters[] = ", ";
+        char *value = NULL;
+        DWORD value_size = 0;
 
-				memset(&certSelect, 0, sizeof(CERT_SELECT_STRUCT));
-				certSelect.arrayCertContext = &pSelCert;
-				certSelect.hwndParent = GetForegroundWindow();
-				certSelect.cCertStore = 1;   
-				certSelect.arrayCertStore = &cert_store; 
-				certSelect.cCertContext = 1;
-				
-				//configure properties
-				memcpy(input_copy, cert_prop, strlen(cert_prop) +1);
-				token_ptr = strtok(input_copy, delimiters);
+        char *filename = "\\.openvpn_hash";
+        char homedir[256 + sizeof(filename) +1];
 
-				while(token_ptr != NULL)
-				{
-					if (!strncmp(token_ptr, "checkValid", 10))
-						certSelect.pfnFilter = (PFNCMFILTERPROC)&fnFilterCallback;
-					if(!strncmp(token_ptr, "OID=", 4))
-					{
-						token_ptr += 4;
-						if(evaluate_input(token_ptr))					//evaluate input option
-							certSelect.szPurposeOid = token_ptr;
-					}
-					token_ptr = strtok(NULL, delimiters);
-				}
+        cert_prop += 4;
 
-				//invoke dialog
-				if(CertEnumCertificatesInStore(cert_store, pCertContext))
-				{
-					if(pCertSelectCertificate(&certSelect))
-					{
-						rv = pSelCert;
-						free(input_copy);
-					}
-					else
-					{
-						free(input_copy);
-						CRYPTOAPIerr(CRYPTOAPI_F_CERT_SELECT_CERTIFICATE_W);
-					}
-				}
+        if (get_homedir(homedir, sizeof(homedir) ))
+        {
+            strcat(homedir, filename);
+        }
+        else
+        {
+            /*error code        home dir length does not fit to array */
+        }
 
+        /* try to open file .openvpn_hash located in home dir
+         * and restore last used certificate id */
+        fp = fopen(homedir, "r");
+        if (fp)
+        {
+            if (!fread(saved_value, 1, sizeof(saved_value), fp))
+            {
+                CRYPTOAPIerr(CRYPTOAPI_F_FILE_ACCESS_FAILED);
+            }
+            if (fclose(fp))
+            {
+                CRYPTOAPIerr(CRYPTOAPI_F_FILE_ACCESS_FAILED);
+            }
 
-			}
-		FreeLibrary(hLib);
-		}
-	}
+            while (pCertContext = CertEnumCertificatesInStore(cert_store, pCertContext))
+            {
+                if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, NULL, &value_size))
+                {
+                    error_code = GetLastError();
+                }
+                value = (char *)malloc(value_size);
+
+                if (!CertGetCertificateContextProperty(pCertContext, CERT_HASH_PROP_ID, value, &value_size))
+                {
+                    error_code = GetLastError();
+                }
+
+                if (!memcmp(value, saved_value, value_size))
+                {
+                    certificate_match = true;
+                    break;
+                }
+                if (value)
+                {
+                    free(value);
+                }
+            }
+
+            if (value)
+            {
+                free(value);
+            }
+            value = NULL;
+
+            if (certificate_match)
+            {
+                return pCertContext;
+            }
+        }
+
+        /*if not certificate id was saved in <HOME>/.openvpn_hash,*/
+        /* or the id is not available open dialog */
+        if (hLib == NULL)
+        {
+            CRYPTOAPIerr(CRYPTOAPI_F_CERT_OPEN_SYSTEM_STORE);
+        }
+        else
+        {
+            BOOL(WINAPI *pCertSelectCertificate)(PCERT_SELECT_STRUCT) = NULL;
+            PCCERT_CONTEXT pSelCert = NULL;
+            CERT_SELECT_STRUCT certSelect;
+
+            pCertSelectCertificate = (BOOL(WINAPI *)(PCERT_SELECT_STRUCT))GetProcAddress(hLib, CERT_SELECT_DLL);
+
+            if (pCertSelectCertificate == NULL)
+            {
+                CRYPTOAPIerr(CRYPTOAPI_F_CERT_SELECT_CERTIFICATE);
+                /*call findCertificateInStore and search the saved (last) certificate in the store */
+                /*if found return it with the function */
+            }
+            else
+            {
+                char *token_ptr;
+                char *input_copy = (char *)malloc(strlen(cert_prop) +1);
+                char delimiters[] = ", ";
+
+                /*configure structure to include available certificates */
+                memset(&certSelect, 0, sizeof(CERT_SELECT_STRUCT));
+                certSelect.arrayCertContext = &pSelCert;
+                certSelect.hwndParent = GetForegroundWindow();
+                certSelect.cCertStore = 1;
+                certSelect.cCertContext = 1;
+                certSelect.arrayCertStore = &cert_store;
+                certSelect.szPurposeOid = NULL;  /* szOID_KP_SMARTCARD_LOGON; */
+                certSelect.pfnFilter = (PFNCMFILTERPROC)&fnFilterCallback;
+
+                /*set specified properties for the certificates to display */
+                memcpy(input_copy, cert_prop, strlen(cert_prop) +1);
+                token_ptr = strtok(input_copy, delimiters);
+
+                while (token_ptr != NULL)
+                {
+                    if (!strncmp(token_ptr, "includeOld", 12))
+                    {
+                        certSelect.pfnFilter = NULL;
+                    }
+                    if (!strncmp(token_ptr, "OID=", 4))
+                    {
+                        token_ptr += 4;
+
+                        while (isspace(*token_ptr))
+                        {
+                            token_ptr++;
+                        }
+
+                        if (evaluate_OID(token_ptr))
+                        {
+                            certSelect.szPurposeOid = token_ptr;
+                        }
+                    }
+                    token_ptr = strtok(NULL, delimiters);
+                }
+
+                /*invoke dialog */
+                if (pCertSelectCertificate(&certSelect))
+                {
+
+                    value_size = 0;
+                    rv = pSelCert;
+
+                    if (!CertGetCertificateContextProperty(rv, CERT_HASH_PROP_ID, NULL, &value_size))
+                    {
+                        error_code = GetLastError();
+                    }
+
+                    value = (char *)malloc(value_size);
+
+                    if (!CertGetCertificateContextProperty(rv, CERT_HASH_PROP_ID, value, &value_size))
+                    {
+                        error_code = GetLastError();
+                    }
+
+                    fp =  fopen(homedir, "w+");
+                    if (!fp)
+                    {
+                        CRYPTOAPIerr(CRYPTOAPI_F_FILE_ACCESS_FAILED);
+                    }
+
+                    if (fwrite(value, 1, value_size, fp) < 0)
+                    {
+                        CRYPTOAPIerr(CRYPTOAPI_F_FILE_ACCESS_FAILED);
+                    }
+
+                    if (fclose(fp))
+                    {
+                        CRYPTOAPIerr(CRYPTOAPI_F_FILE_ACCESS_FAILED);
+                    }
+
+                    if (value)
+                    {
+                        free(value);
+                    }
+
+                    if (input_copy)
+                    {
+                        free(input_copy);
+                    }
+                }
+                else
+                {
+                    free(input_copy);
+                    CRYPTOAPIerr(CRYPTOAPI_F_CERT_SELECT_CERTIFICATE);
+                }
+            }
+        }
+        FreeLibrary(hLib);
+    }
     return rv;
 }
 
